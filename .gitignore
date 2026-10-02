@@ -2,4 +2,5 @@
 __pycache__/
 .vscode/
 seq2seq_metadata.pkl
+seq2seq_translation.keras
 seq2seq_model.png

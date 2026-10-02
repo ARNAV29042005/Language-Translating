@@ -1,98 +1,95 @@
-import pickle
+import re
 
-import numpy as np
-from tensorflow.keras.layers import Dense, Embedding, Input, LSTM
-from tensorflow.keras.models import Model
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-try:
-    import pydot  # noqa: F401
-    from tensorflow.keras.utils import plot_model
-except ImportError:
-    plot_model = None
 
-# Example training data
-input_texts = ["hi", "hello", "yes", "no", "go", "stop"]
-target_texts = ["salut", "bonjour", "oui", "non", "va", "arrêt"]
+MODEL_NAME = "Helsinki-NLP/opus-mt-en-fr"
 
-# Create vocabulary sets
-input_characters = sorted({ch for text in input_texts for ch in text})
-target_characters = sorted({ch for text in target_texts for ch in text})
 
-# Add padding and start/end tokens for decoder
-input_characters = ["<pad>"] + input_characters
-target_characters = ["<pad>", "<start>", "<end>"] + target_characters
+def _token_count(text, tokenizer):
+    return len(tokenizer.encode(text, add_special_tokens=False))
 
-input_token_index = {char: i for i, char in enumerate(input_characters)}
-target_token_index = {char: i for i, char in enumerate(target_characters)}
 
-# Sequence lengths
-max_input_len = max(len(text) for text in input_texts)
-max_target_len = max(len(text) for text in target_texts) + 2
+def _split_long_sentence(sentence, tokenizer, max_input_tokens):
+    words = sentence.split()
+    parts = []
+    current_words = []
 
-# Prepare encoder input data
-encoder_input_data = np.zeros((len(input_texts), max_input_len), dtype="int32")
-for i, text in enumerate(input_texts):
-    for t, char in enumerate(text):
-        encoder_input_data[i, t] = input_token_index[char]
+    for word in words:
+        if _token_count(word, tokenizer) > max_input_tokens:
+            if current_words:
+                parts.append(" ".join(current_words))
+                current_words = []
+            word_tokens = tokenizer.encode(word, add_special_tokens=False)
+            for start in range(0, len(word_tokens), max_input_tokens):
+                token_chunk = word_tokens[start : start + max_input_tokens]
+                parts.append(tokenizer.decode(token_chunk, skip_special_tokens=True))
+            continue
 
-# Prepare decoder input and target data
-num_decoder_tokens = len(target_characters)
-decoder_input_data = np.zeros((len(target_texts), max_target_len), dtype="int32")
-decoder_target_data = np.zeros((len(target_texts), max_target_len, num_decoder_tokens), dtype="float32")
+        candidate = " ".join(current_words + [word])
+        if current_words and _token_count(candidate, tokenizer) > max_input_tokens:
+            parts.append(" ".join(current_words))
+            current_words = [word]
+        else:
+            current_words.append(word)
 
-for i, text in enumerate(target_texts):
-    decoder_input_data[i, 0] = target_token_index["<start>"]
-    for t, char in enumerate(text):
-        decoder_input_data[i, t + 1] = target_token_index[char]
-        decoder_target_data[i, t + 1, target_token_index[char]] = 1.0
-    decoder_target_data[i, len(text) + 1, target_token_index["<end>"]] = 1.0
+    if current_words:
+        parts.append(" ".join(current_words))
+    return parts
 
-# Model parameters
-latent_dim = 64
 
-# Encoder model
-encoder_inputs = Input(shape=(max_input_len,), dtype="int32", name="encoder_input")
-encoder_embedding = Embedding(len(input_characters), latent_dim, mask_zero=True)(encoder_inputs)
-encoder_outputs, state_h, state_c = LSTM(latent_dim, return_state=True)(encoder_embedding)
-encoder_states = [state_h, state_c]
+def _split_text(text, tokenizer, max_input_tokens):
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", text.strip())
+    chunks = []
+    for sentence in sentences:
+        if not sentence.strip():
+            continue
+        chunks.extend(_split_long_sentence(sentence, tokenizer, max_input_tokens))
+    return chunks
 
-# Decoder model
-decoder_inputs = Input(shape=(max_target_len,), dtype="int32", name="decoder_input")
-decoder_embedding = Embedding(len(target_characters), latent_dim, mask_zero=True)(decoder_inputs)
-decoder_outputs, _, _ = LSTM(latent_dim, return_sequences=True, return_state=True)(
-    decoder_embedding, initial_state=encoder_states
-)
-decoder_dense = Dense(len(target_characters), activation="softmax")
-decoder_outputs = decoder_dense(decoder_outputs)
 
-# Build and compile model
-model = Model([encoder_inputs, decoder_inputs], decoder_outputs)
-model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+def main():
+    print(f"Loading {MODEL_NAME}. The first run downloads the model files.")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
 
-# Save metadata
-with open("seq2seq_metadata.pkl", "wb") as file:
-    pickle.dump(
-        {
-            "input_token_index": input_token_index,
-            "target_token_index": target_token_index,
-            "max_input_len": max_input_len,
-            "max_target_len": max_target_len,
-        },
-        file,
-    )
+    max_positions = getattr(model.config, "max_position_embeddings", 512)
+    max_input_tokens = max(16, max_positions - 8)
 
-# Display model structure
-model.summary()
-if plot_model is not None:
-    try:
-        plot_model(model, to_file="seq2seq_model.png", show_shapes=True)
-        print("Model diagram saved to seq2seq_model.png")
-    except (ImportError, OSError, FileNotFoundError, RuntimeError) as exc:
-        print(f"Skipping model diagram generation: {exc}")
-else:
-    print("pydot/graphviz is not installed; skipping model diagram generation.")
+    def translate(text):
+        if not text.strip():
+            raise ValueError("Enter some English text to translate.")
 
-print("\nModel built successfully.")
-print("Encoder input shape:", encoder_input_data.shape)
-print("Decoder input shape:", decoder_input_data.shape)
-print("Decoder target shape:", decoder_target_data.shape)
+        translated_chunks = []
+        for chunk in _split_text(text, tokenizer, max_input_tokens):
+            encoded = tokenizer(chunk, return_tensors="pt", truncation=False)
+            encoded = {key: value.to(device) for key, value in encoded.items()}
+            with torch.inference_mode():
+                output = model.generate(
+                    **encoded,
+                    num_beams=4,
+                    max_length=max_input_tokens + 1,
+                )
+            translated_chunks.append(tokenizer.decode(output[0], skip_special_tokens=True))
+        return " ".join(translated_chunks)
+
+    print("English-to-French translator ready. Type 'quit' to exit.")
+    while True:
+        try:
+            text = input("English> ")
+        except EOFError:
+            break
+        if text.strip().lower() in {"quit", "exit"}:
+            break
+        try:
+            print(f"French> {translate(text)}")
+        except ValueError as exc:
+            print(exc)
+
+
+if __name__ == "__main__":
+    main()
